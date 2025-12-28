@@ -1,0 +1,39 @@
+{
+  "taskGroups": [
+    {
+      "taskCount": 40,
+      "parallelism": 40,
+      "taskSpec": {
+        "runnables": [
+          {
+            "container": {
+              "imageUri": "us-central1-docker.pkg.dev/physicianscopilot/pubmed-repo/pipeline:v1"
+            },
+            "environment": {
+              "variables": {
+                "GCS_BUCKET": "pcp-pubmed-articles-store",
+                "GCS_CREDENTIALS": "/app/gcs_service_account.json",
+                "PARQUET_OUT": "/tmp/parquet"
+              }
+            }
+          }
+        ],
+        "computeResource": {
+          "cpuMilli": 2000,
+          "memoryMib": 8192
+        },
+        "maxRetryCount": 3
+      }
+    }
+  ],
+  "allocationPolicy": {
+    "instances": [
+      {
+        "policy": {
+          "provisioningModel": "SPOT"
+        }
+      }
+    ]
+  },
+  "logsPolicy": { "destination": "CLOUD_LOGGING" }
+}
