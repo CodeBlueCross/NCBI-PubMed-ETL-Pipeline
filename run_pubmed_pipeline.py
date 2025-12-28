@@ -10,11 +10,13 @@ import pandas as pd
 import gcsfs
 from google.cloud import storage
 import vertexai
-from vertexai.language_models import TextEmbeddingModel
+from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, VectorParams, Distance
 from dotenv import load_dotenv
 
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.api_core import exceptions as google_exceptions
 # Load env vars
 load_dotenv(dotenv_path='./.env')
 
@@ -85,8 +87,8 @@ def init_resources():
     return qdrant_client
 
 def get_embedding_model():
-    """Returns the Gemini Embedding Model."""
-    return TextEmbeddingModel.from_pretrained("text-embedding-004")
+    """Returns the latest SOTA Gemini Embedding Model."""
+    return TextEmbeddingModel.from_pretrained("gemini-embedding-001")
 
 def list_gcs_parquet_files(bucket_name):
     """Lists all parquet files in the bucket using GCS Client."""
@@ -106,9 +108,6 @@ def list_gcs_parquet_files(bucket_name):
     
     return sorted(parquet_files)
 
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from google.api_core import exceptions as google_exceptions
-
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=2, max=60),
@@ -119,15 +118,20 @@ from google.api_core import exceptions as google_exceptions
     ))
 )
 def generate_embeddings_batch(model, texts):
-    """Generates embeddings for a batch of texts using Vertex AI, with retry logic."""
+    """Generates embeddings using Gemini-001, resized to 768 dims."""
     try:
-        # Vertex AI TextEmbeddingModel takes a list of strings
-        # Limit is 250 per request in us-central1, but we use a smaller batch (e.g. 50) to be safe with tokens
-        embeddings = model.get_embeddings(texts)
+        # wrap in TextEmbeddingInput with 'RETRIEVAL_DOCUMENT' task_type
+        inputs = [
+            TextEmbeddingInput(text=text, task_type="RETRIEVAL_DOCUMENT") 
+            for text in texts
+        ]
+        embeddings = model.get_embeddings(inputs, output_dimensionality=768)
+        
         return [embedding.values for embedding in embeddings]
+        
     except Exception as e:
         logger.warning(f"Error generating embeddings (will retry if transient): {e}")
-        raise # Let tenacity handle the retry
+        raise
 
 
 def process_file(file_path, qdrant_client, embed_model):
