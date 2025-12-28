@@ -1,39 +1,44 @@
 {
   "taskGroups": [
     {
-      "taskCount": 40,
-      "parallelism": 40,
       "taskSpec": {
-        "runnables": [
-          {
-            "container": {
-              "imageUri": "us-central1-docker.pkg.dev/physicianscopilot/pubmed-repo/pipeline:v1"
-            },
-            "environment": {
-              "variables": {
-                "GCS_BUCKET": "pcp-pubmed-articles-store",
-                "GCS_CREDENTIALS": "/app/gcs_service_account.json",
-                "PARQUET_OUT": "/tmp/parquet"
-              }
-            }
+        "runnable": {
+          "container": {
+            "imageUri": "gcr.io/physicianscopilot/pubmed-vectorizer:latest",
+            "entrypoint": "",
+            "commands": [
+              "python",
+              "run_pubmed_pipeline.py"
+            ]
           }
-        ],
-        "computeResource": {
-          "cpuMilli": 2000,
-          "memoryMib": 8192
         },
-        "maxRetryCount": 3
-      }
+        "environment": {
+          "variables": {
+            "GCS_BUCKET": "pcp-pubmed-articles-store",
+            "QDRANT_URL": "https://qdrant-581583863729.us-central1.run.app",
+            "GCP_PROJECT_ID": "physicianscopilot",
+            "GCP_LOCATION": "us-central1",
+            "GCS_CREDENTIALS": "/app/gcs_service_account.json"
+          }
+        },
+        "maxRetryCount": 3,
+        "maxRunDuration": "3600s"
+      },
+      "taskCount": 10,
+      "parallelism": 5
     }
   ],
   "allocationPolicy": {
     "instances": [
       {
         "policy": {
-          "provisioningModel": "SPOT"
+          "machineType": "e2-standard-4",
+          "provisioningModel": "STANDARD"
         }
       }
     ]
   },
-  "logsPolicy": { "destination": "CLOUD_LOGGING" }
+  "logsPolicy": {
+    "destination": "CLOUD_LOGGING"
+  }
 }

@@ -1,14 +1,15 @@
 steps:
-  # Step 1: Build the Docker image
+  # Build the container image
   - name: 'gcr.io/cloud-builders/docker'
-    args: [ 'build', '-t', 'us-central1-docker.pkg.dev/physicianscopilot/pubmed-repo/pipeline:v1', '.' ]
-
-  # Step 2: Push the image to Artifact Registry
+    args: ['build', '-t', 'gcr.io/physicianscopilot/pubmed-vectorizer:latest', '.']
+  
+  # Push the container image to Container Registry
   - name: 'gcr.io/cloud-builders/docker'
-    args: [ 'push', 'us-central1-docker.pkg.dev/physicianscopilot/pubmed-repo/pipeline:v1' ]
+    args: ['push', 'gcr.io/physicianscopilot/pubmed-vectorizer:latest']
 
 images:
-  - 'us-central1-docker.pkg.dev/physicianscopilot/pubmed-repo/pipeline:v1'
+  - 'gcr.io/physicianscopilot/pubmed-vectorizer:latest'
+
 
 options:
   logging: CLOUD_LOGGING_ONLY

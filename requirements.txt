@@ -2,3 +2,6 @@ python-dotenv
 pandas
 pyarrow
 google-cloud-storage
+qdrant-client
+google-cloud-aiplatform
+gcsfs

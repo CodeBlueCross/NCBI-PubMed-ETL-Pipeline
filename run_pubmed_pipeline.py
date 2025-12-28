@@ -1,124 +1,258 @@
+
 import os
-import shutil
-import math
 import logging
+import math
+import hashlib
+import json
+import time
+
+import pandas as pd
+import gcsfs
+from google.cloud import storage
+import vertexai
+from vertexai.language_models import TextEmbeddingModel
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct, VectorParams, Distance
 from dotenv import load_dotenv
 
-from download_pubmed import list_pubmed_files, download_batch
-from decompress_xml import decompress_gz_files
-from parse_and_partition import parse_and_partition_xml
-from gcs_upload import upload_to_gcs
-
-# Load ENVs from .env
+# Load env vars
 load_dotenv(dotenv_path='./.env')
 
-LOCAL_DIR = os.environ.get("LOCAL_DIR", "./pubmed_xml_gz")
-PARQUET_OUT = os.environ.get("PARQUET_OUT", "./pubmed_parquet/")
+# --- CONFIGURATION ---
+GCS_BUCKET = os.environ.get("GCS_BUCKET")
+QDRANT_URL = os.environ.get("QDRANT_URL")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", None)
+GCS_CREDENTIALS = os.environ.get("GCS_CREDENTIALS")
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
+COLLECTION_NAME = "pubmed_articles"
+
+# Cloud Batch Indexing
+BATCH_TASK_INDEX = int(os.environ.get("BATCH_TASK_INDEX", 0))
+BATCH_TASK_COUNT = int(os.environ.get("BATCH_TASK_COUNT", 1))
 
 # Setup Logging
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler("pipeline_execution.log"),
-            logging.StreamHandler()
-        ]
+        format='%(asctime)s - %(name)s - %(levelname)s - %(task_idx)s - %(message)s',
+        handlers=[logging.StreamHandler()]
     )
+    # Add task index to log record
+    old_factory = logging.getLogRecordFactory()
+    def record_factory(*args, **kwargs):
+        record = old_factory(*args, **kwargs)
+        record.task_idx = BATCH_TASK_INDEX
+        return record
+    logging.setLogRecordFactory(record_factory)
 
-logger = logging.getLogger("MainPipeline")
+logger = logging.getLogger("VectorizationPipeline")
 
-def cleanup_intermediate_files():
-    """Deletes downloaded XML/GZ and generated Parquet files to save space."""
-    # Clean LOCAL_DIR (xml.gz and xml)
-    if os.path.exists(LOCAL_DIR):
-        for f in os.listdir(LOCAL_DIR):
-            file_path = os.path.join(LOCAL_DIR, f)
+def init_resources():
+    """Initialize Vertex AI and Qdrant."""
+    global GCP_PROJECT_ID
+    
+    # Try to extract project ID from credentials if missing
+    if not GCP_PROJECT_ID and GCS_CREDENTIALS and os.path.exists(GCS_CREDENTIALS):
+        try:
+            with open(GCS_CREDENTIALS, 'r') as f:
+                creds_data = json.load(f)
+                GCP_PROJECT_ID = creds_data.get("project_id")
+                logger.info(f"Extracted Project ID from credentials: {GCP_PROJECT_ID}")
+        except Exception as e:
+            logger.error(f"Failed to extract Project ID from credentials: {e}")
+
+    if not GCP_PROJECT_ID:
+        logger.error("GCP_PROJECT_ID not set and could not be extracted.")
+        raise ValueError("GCP_PROJECT_ID is required.")
+    
+    vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
+    
+    # Qdrant Client
+    qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+    
+    # Ensure collection exists
+    try:
+        qdrant_client.get_collection(COLLECTION_NAME)
+        logger.info(f"Collection '{COLLECTION_NAME}' exists.")
+    except Exception:
+        logger.info(f"Collection '{COLLECTION_NAME}' does not exist. Creating...")
+        qdrant_client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+        )
+    return qdrant_client
+
+def get_embedding_model():
+    """Returns the Gemini Embedding Model."""
+    return TextEmbeddingModel.from_pretrained("text-embedding-004")
+
+def list_gcs_parquet_files(bucket_name):
+    """Lists all parquet files in the bucket using GCS Client."""
+    if GCS_CREDENTIALS and os.path.exists(GCS_CREDENTIALS):
+        storage_client = storage.Client.from_service_account_json(GCS_CREDENTIALS)
+    else:
+        storage_client = storage.Client()
+        
+    bucket = storage_client.bucket(bucket_name)
+    blobs = bucket.list_blobs()
+
+    
+    parquet_files = []
+    for blob in blobs:
+        if blob.name.endswith(".parquet"):
+            parquet_files.append(f"gs://{bucket_name}/{blob.name}")
+    
+    return sorted(parquet_files)
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.api_core import exceptions as google_exceptions
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    retry=retry_if_exception_type((
+        google_exceptions.ResourceExhausted, 
+        google_exceptions.ServiceUnavailable,
+        google_exceptions.TooManyRequests
+    ))
+)
+def generate_embeddings_batch(model, texts):
+    """Generates embeddings for a batch of texts using Vertex AI, with retry logic."""
+    try:
+        # Vertex AI TextEmbeddingModel takes a list of strings
+        # Limit is 250 per request in us-central1, but we use a smaller batch (e.g. 50) to be safe with tokens
+        embeddings = model.get_embeddings(texts)
+        return [embedding.values for embedding in embeddings]
+    except Exception as e:
+        logger.warning(f"Error generating embeddings (will retry if transient): {e}")
+        raise # Let tenacity handle the retry
+
+
+def process_file(file_path, qdrant_client, embed_model):
+    """Reads a parquet file, vectorizes, and upserts to Qdrant."""
+    logger.info(f"Processing file: {file_path}")
+    
+    try:
+        df = pd.read_parquet(file_path)
+    except Exception as e:
+        logger.error(f"Failed to read parquet {file_path}: {e}")
+        return
+
+    # Filter out rows with empty titles or abstracts
+    df['title'] = df['title'].fillna('')
+    df['abstract'] = df['abstract'].fillna('')
+    
+    # Create combined text for embedding
+    # Format: "Title: <title>\nAbstract: <abstract>"
+    df['text_to_embed'] = "Title: " + df['title'] + "\nAbstract: " + df['abstract']
+    
+    # Remove empty texts (if both title and abstract were empty)
+    df = df[df['text_to_embed'].str.strip() != "Title: \nAbstract:"]
+    
+    if df.empty:
+        logger.warning(f"No valid articles in {file_path}")
+        return
+
+    # Process in batches
+    BATCH_SIZE = 50 # Vertex AI limit suggestion
+    total_rows = len(df)
+    
+    points_to_upsert = []
+    
+    for i in range(0, total_rows, BATCH_SIZE):
+        batch = df.iloc[i : i+BATCH_SIZE].copy()
+        texts = batch['text_to_embed'].tolist()
+        
+        embeddings = generate_embeddings_batch(embed_model, texts)
+        
+        if not embeddings:
+            continue
+            
+        # Create Qdrant Points
+        for idx, row in enumerate(batch.itertuples(index=False)):
+            if idx >= len(embeddings):
+                break
+                
+            vector = embeddings[idx]
+            
+            # Metadata
+            payload = {
+                "pmid": row.pmid,
+                "title": row.title,
+                "publication_year": row.publication_year,
+                "journal": row.journal,
+                "authors": row.authors,
+                "doi": row.doi,
+                 # Truncate abstract to save space if needed, keeping full for now
+                "abstract": row.abstract[:1000] 
+            }
+            
+            # Use PMID as ID if integer, else hash it
             try:
-                if os.path.isfile(file_path):
-                    os.unlink(file_path)
-            except Exception as e:
-                logger.error(f"Error deleting {file_path}: {e}", exc_info=True)
+                point_id = int(row.pmid)
+            except (ValueError, TypeError):
+                point_id = hashlib.md5(str(row.pmid).encode()).hexdigest()
 
-    # Clean PARQUET_OUT
-    if os.path.exists(PARQUET_OUT):
-        for root, dirs, files in os.walk(PARQUET_OUT):
-            for f in files:
-                file_path = os.path.join(root, f)
-                try:
-                    os.unlink(file_path)
-                except Exception as e:
-                    logger.error(f"Error deleting {file_path}: {e}", exc_info=True)
-            # Try to remove empty directories
-            for d in dirs:
-                dir_path = os.path.join(root, d)
-                try:
-                    os.rmdir(dir_path)
-                except Exception as e:
-                    pass # Directory might not be empty, acceptable
+            points_to_upsert.append(
+                PointStruct(id=point_id, vector=vector, payload=payload)
+            )
+
+    # Upsert to Qdrant
+    if points_to_upsert:
+        try:
+            # Upsert in chunks to avoid request size limits
+            UPSERT_CHUNK_SIZE = 100
+            for k in range(0, len(points_to_upsert), UPSERT_CHUNK_SIZE):
+                chunk = points_to_upsert[k : k+UPSERT_CHUNK_SIZE]
+                qdrant_client.upsert(
+                    collection_name=COLLECTION_NAME,
+                    points=chunk
+                )
+            logger.info(f"Upserted {len(points_to_upsert)} points from {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to upsert to Qdrant: {e}")
 
 def main():
     setup_logging()
-    logger.info("Pipeline started.")
-    
-    logger.info("STEP 0: Connecting to FTP to list all available files...")
-    all_files = list_pubmed_files()
-    
-    # === CLOUD BATCH SLICING ===
-    # Get batch info from environment variables (defaults to 0/1 for local run)
-    task_index = int(os.environ.get("BATCH_TASK_INDEX", 0))
-    task_count = int(os.environ.get("BATCH_TASK_COUNT", 1))
+    logger.info("Starting Vectorization Pipeline...")
 
-    # Log batch info
-    if task_count > 1:
-        logger.info(f"Running in Cloud Batch: Task {task_index}/{task_count}")
-
-    # total files found
-    total_files_count = len(all_files)
-
-    # Calculate slice
-    files_per_task = math.ceil(total_files_count / task_count)
-    start_idx = task_index * files_per_task
-    end_idx = start_idx + files_per_task
-    
-    # Slice the list
-    my_files = all_files[start_idx:end_idx]
-    
-    logger.info(f"Task {task_index} processing files from index {start_idx} to {end_idx} (Total: {len(my_files)} files)")
-
-    # Update main list to just this slice
-    all_files = my_files
-
-    BATCH_SIZE = 5
-    if not all_files:
-        logger.warning(f"Task {task_index} has no files to process.")
+    if not GCS_BUCKET:
+        logger.error("GCS_BUCKET env var missing.")
         return
 
-    total_batches = math.ceil(len(all_files) / BATCH_SIZE)
+    # Initialize Resources
+    try:
+        qdrant_client = init_resources()
+        embed_model = get_embedding_model()
+    except Exception as e:
+        logger.critical(f"Initialization failed: {e}", exc_info=True)
+        return
 
-    for i in range(total_batches):
-        batch_files = all_files[i*BATCH_SIZE : (i+1)*BATCH_SIZE]
-        batch_num = i + 1
-        logger.info(f"=== STARTING BATCH {batch_num}/{total_batches} ({len(batch_files)} files) ===")
-        
-        logger.info(f"Batch {batch_num}: Downloading...")
-        download_batch(batch_files)
-        
-        logger.info(f"Batch {batch_num}: Decompressing...")
-        decompress_gz_files()
-        
-        logger.info(f"Batch {batch_num}: Parsing and Partitioning...")
-        parse_and_partition_xml()
-        
-        logger.info(f"Batch {batch_num}: Uploading to GCS...")
-        upload_to_gcs()
-        
-        logger.info(f"Batch {batch_num}: Cleaning up local files...")
-        cleanup_intermediate_files()
-        
-        logger.info(f"=== COMPLETED BATCH {batch_num}/{total_batches} ===")
+    # List Files
+    logger.info(f"Listing files in gs://{GCS_BUCKET}...")
+    all_files = list_gcs_parquet_files(GCS_BUCKET)
     
-    logger.info("Pipeline completed successfully!")
+    total_files = len(all_files)
+    logger.info(f"Total Parquet files found: {total_files}")
+
+    # Slicing for Batch
+    if BATCH_TASK_COUNT > 1:
+        files_per_task = math.ceil(total_files / BATCH_TASK_COUNT)
+        start_idx = BATCH_TASK_INDEX * files_per_task
+        end_idx = start_idx + files_per_task
+        my_files = all_files[start_idx:end_idx]
+        logger.info(f"Task {BATCH_TASK_INDEX}/{BATCH_TASK_COUNT}: Processing files {start_idx} to {end_idx} ({len(my_files)} files)")
+    else:
+        my_files = all_files
+        logger.info(f"Running locally/single-task. Processing all {len(my_files)} files.")
+
+    # Process
+    for fpath in my_files:
+        process_file(fpath, qdrant_client, embed_model)
+
+    logger.info("Pipeline Task Completed.")
 
 if __name__ == "__main__":
     main()
