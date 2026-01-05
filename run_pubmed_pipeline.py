@@ -3,6 +3,7 @@ import logging
 import math
 import hashlib
 import json
+import io
 
 import pandas as pd
 from google.cloud import storage
@@ -31,6 +32,7 @@ COLLECTION_NAME = "pubmed_articles"
 
 BATCH_TASK_INDEX = int(os.environ.get("BATCH_TASK_INDEX", 0))
 BATCH_TASK_COUNT = int(os.environ.get("BATCH_TASK_COUNT", 1))
+GCS_PREFIX = os.environ.get("GCS_PREFIX", "")
 
 
 def setup_logging():
@@ -81,7 +83,7 @@ def init_resources():
 
 
 def get_embedding_model_name():
-    return "gemini-embedding-001"
+    return os.environ.get("EMBEDDING_MODEL_NAME", "gemini-embedding-001")
 
 
 def list_gcs_parquet_files(bucket_name):
@@ -91,7 +93,7 @@ def list_gcs_parquet_files(bucket_name):
         storage_client = storage.Client()
 
     bucket = storage_client.bucket(bucket_name)
-    blobs = bucket.list_blobs()
+    blobs = bucket.list_blobs(prefix=GCS_PREFIX)
 
     return sorted(
         f"gs://{bucket_name}/{blob.name}"
@@ -127,9 +129,25 @@ def generate_embeddings_batch(client, model_name, texts):
 
 def process_file(file_path, qdrant_client, genai_client, embed_model_name):
     logger.info(f"Processing file: {file_path}")
-
+    
     try:
-        df = pd.read_parquet(file_path)
+        # Direct download from GCS to avoid gcsfs stalls
+        if GCS_CREDENTIALS and os.path.exists(GCS_CREDENTIALS):
+            storage_client = storage.Client.from_service_account_json(GCS_CREDENTIALS)
+        else:
+            storage_client = storage.Client()
+            
+        bucket_name = file_path.replace("gs://", "").split("/")[0]
+        blob_path = "/".join(file_path.replace("gs://", "").split("/")[1:])
+        
+        logger.info(f"Downloading {blob_path} from bucket {bucket_name}...")
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        content = blob.download_as_bytes()
+        logger.info(f"Downloaded {len(content)} bytes.")
+        
+        df = pd.read_parquet(io.BytesIO(content))
+        logger.info(f"Loaded parquet with {len(df)} rows.")
     except Exception as e:
         logger.error(f"Failed to read parquet {file_path}: {e}")
         return
@@ -154,11 +172,13 @@ def process_file(file_path, qdrant_client, genai_client, embed_model_name):
         batch = df.iloc[i : i + BATCH_SIZE].copy()
         texts = batch["text_to_embed"].tolist()
 
+        logger.info(f"Generating embeddings for batch of {len(texts)} rows...")
         embeddings = generate_embeddings_batch(
             genai_client,
             embed_model_name,
             texts,
         )
+        logger.info(f"Successfully generated {len(embeddings)} embeddings.")
 
         for idx, row in enumerate(batch.itertuples(index=False)):
             if idx >= len(embeddings):
@@ -193,6 +213,7 @@ def process_file(file_path, qdrant_client, genai_client, embed_model_name):
     try:
         UPSERT_CHUNK_SIZE = 100
         for k in range(0, len(points_to_upsert), UPSERT_CHUNK_SIZE):
+            logger.info(f"Upserting chunk {k//UPSERT_CHUNK_SIZE + 1} to Qdrant...")
             qdrant_client.upsert(
                 collection_name=COLLECTION_NAME,
                 points=points_to_upsert[k : k + UPSERT_CHUNK_SIZE],

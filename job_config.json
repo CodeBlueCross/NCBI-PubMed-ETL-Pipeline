@@ -2,23 +2,28 @@
   "taskGroups": [
     {
       "taskSpec": {
-        "runnable": {
-          "container": {
-            "imageUri": "gcr.io/physicianscopilot/pubmed-vectorizer:latest",
-            "entrypoint": "",
-            "commands": [
-              "python",
-              "run_pubmed_pipeline.py"
-            ]
+        "runnables": [
+          {
+            "container": {
+              "imageUri": "gcr.io/physicianscopilot/pubmed-vectorizer:latest",
+              "entrypoint": "",
+              "commands": []
+            }
           }
-        },
+        ],
         "environment": {
           "variables": {
             "GCS_BUCKET": "pcp-pubmed-articles-store",
-            "QDRANT_URL": "https://qdrant-581583863729.us-central1.run.app",
+            "GCS_PREFIX": "",
+            "QDRANT_URL": "http://34.134.76.70:6333",
             "GCP_PROJECT_ID": "physicianscopilot",
             "GCP_LOCATION": "us-central1",
-            "GCS_CREDENTIALS": "/app/gcs_service_account.json"
+            "GCS_CREDENTIALS": "/app/gcs_service_account.json",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/app/gcs_service_account.json",
+            "BATCH_TASK_COUNT": "10",
+            "COLLECTION_NAME": "pubmed_articles",
+            "EMBEDDING_MODEL_NAME": "gemini-embedding-001",
+            "GOOGLE_API_KEY": "AIzaSyA8r4TQ-nocgzk9hfpfTn8edSIU8c5x45w"
           }
         },
         "maxRetryCount": 3,
@@ -29,6 +34,9 @@
     }
   ],
   "allocationPolicy": {
+    "serviceAccount": {
+      "email": "service-account-for-cloud-stor@physicianscopilot.iam.gserviceaccount.com"
+    },
     "instances": [
       {
         "policy": {
